@@ -1,4 +1,5 @@
 import base64
+import json
 import httpx
 
 
@@ -22,6 +23,19 @@ async def send_report(
     Uploads the generated PDF to the configured Discord channel via the bot API.
     Fire-and-forget by design: called from a BackgroundTask so a Discord failure
     never affects the main /research response the user already received.
+
+    BUG FIX: the Discord multipart "payload_json" field was previously built
+    by hand-interpolating strings into a JSON-looking literal and only
+    escaping newlines:
+
+        f'{{"content": "{message_content}"}}'.replace("\\n", "\\\\n")
+
+    Any applicant name, company name, or email containing a double quote,
+    backslash, or other JSON-special character (e.g. an applicant named
+    O'Brien "the closer" Smith) produced invalid JSON, which Discord's API
+    rejects outright - so the whole notification silently failed for any
+    input that wasn't perfectly plain text. We now build a real dict and
+    serialize it with json.dumps, which escapes everything correctly.
     """
     if not bot_token or not channel_id:
         raise ValueError("Discord bot token and channel ID are required.")
@@ -39,8 +53,10 @@ async def send_report(
     url = f"https://discord.com/api/v10/channels/{channel_id}/messages"
     headers = {"Authorization": f"Bot {bot_token}"}
 
+    payload_json = json.dumps({"content": message_content})
+
     files = {
-        "payload_json": (None, f'{{"content": "{message_content}"}}'.replace("\n", "\\n"), "application/json"),
+        "payload_json": (None, payload_json, "application/json"),
         "file": (filename, pdf_bytes, "application/pdf"),
     }
 

@@ -14,10 +14,20 @@ interface SidebarProps {
   onSave: () => void;
 }
 
+// BUG FIX: this list previously didn't match the backend at all.
+// - "Claude Sonnet 4.5" was labeled wrong (its value pointed at 3.5-sonnet).
+// - None of the free-tier fallback models actually used in openrouter.py's
+//   FALLBACK_MODELS chain were even selectable here, including the exact
+//   model ("meta-llama/llama-3.3-70b-instruct:free") already used to test
+//   the API directly. The list now mirrors backend/app/config + schemas.py
+//   (default model) and backend/app/services/openrouter.py (fallback chain),
+//   so "what the user picks" and "what the backend actually knows how to
+//   call" are the same set of IDs.
 const MODELS = [
-  { label: "Claude Sonnet 4.5", value: "anthropic/claude-3.5-sonnet" },
-  { label: "GPT-4o mini", value: "openai/gpt-4o-mini" },
-  { label: "Llama 3.1 70B", value: "meta-llama/llama-3.1-70b-instruct" },
+  { label: "Claude 3.5 Sonnet (default)", value: "anthropic/claude-3.5-sonnet" },
+  { label: "Llama 3.3 70B Instruct (free)", value: "meta-llama/llama-3.3-70b-instruct:free" },
+  { label: "GPT-OSS 20B (free)", value: "openai/gpt-oss-20b:free" },
+  { label: "Qwen 2.5 7B Instruct (free)", value: "qwen/qwen-2.5-7b-instruct:free" },
 ];
 
 export default function Sidebar({
@@ -191,7 +201,7 @@ export default function Sidebar({
       </div>
 
       <div className="mt-auto pt-6 text-[11px] font-mono text-textMuted tracking-wide">
-        OPENROUTER · SERPER · JSPDF
+        OPENROUTER · SERPER · FPDF2
       </div>
     </aside>
   );

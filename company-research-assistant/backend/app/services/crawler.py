@@ -12,87 +12,226 @@ from app.config import (
 
 
 def _normalize_url(url: str) -> str:
-    """Strip fragment/query/trailing slash so we don't re-crawl the same page twice."""
+    """Remove query params, fragments and trailing slash."""
     parsed = urlparse(url)
     normalized = f"{parsed.scheme}://{parsed.netloc}{parsed.path}".rstrip("/")
     return normalized.lower()
 
 
+def _normalize_domain(netloc: str) -> str:
+    """Treat example.com and www.example.com as same."""
+    return netloc.lower().removeprefix("www.")
+
+
 def _is_ignored(url: str) -> bool:
     lowered = url.lower()
-    return any(kw in lowered for kw in IGNORED_PATH_KEYWORDS)
+
+    if any(kw in lowered for kw in IGNORED_PATH_KEYWORDS):
+        return True
+
+    blocked_extensions = (
+        ".pdf",
+        ".jpg",
+        ".jpeg",
+        ".png",
+        ".gif",
+        ".svg",
+        ".zip",
+        ".rar",
+        ".mp4",
+        ".mp3",
+        ".doc",
+        ".docx",
+        ".xls",
+        ".xlsx",
+        ".ppt",
+        ".pptx",
+    )
+
+    if lowered.endswith(blocked_extensions):
+        return True
+
+    if lowered.startswith("mailto:"):
+        return True
+
+    if lowered.startswith("tel:"):
+        return True
+
+    if lowered.startswith("javascript:"):
+        return True
+
+    return False
 
 
 def _is_priority(url: str) -> bool:
     lowered = url.lower()
-    return any(kw in lowered for kw in PRIORITY_PATH_KEYWORDS)
+    return any(keyword in lowered for keyword in PRIORITY_PATH_KEYWORDS)
 
 
 async def _fetch_page(client: httpx.AsyncClient, url: str) -> dict | None:
-    """Fetch a single page. Returns None on any failure - never raises."""
+    """
+    Fetch a page safely.
+    Never throws exceptions.
+    """
+
     try:
-        resp = await client.get(url, timeout=CRAWL_TIMEOUT_SECONDS, follow_redirects=True)
-        content_type = resp.headers.get("content-type", "")
-        if resp.status_code >= 400 or "text/html" not in content_type:
+        response = await client.get(
+            url,
+            timeout=CRAWL_TIMEOUT_SECONDS,
+            follow_redirects=True,
+        )
+
+        content_type = response.headers.get("content-type", "")
+
+        if response.status_code >= 400:
             return None
 
-        soup = BeautifulSoup(resp.text, "html.parser")
-        for tag in soup(["script", "style", "nav", "footer", "noscript"]):
+        if "text/html" not in content_type:
+            return None
+
+        soup = BeautifulSoup(response.text, "html.parser")
+
+        for tag in soup([
+            "script",
+            "style",
+            "nav",
+            "footer",
+            "noscript",
+            "svg",
+            "iframe",
+            "form",
+            "header",
+        ]):
             tag.decompose()
 
-        text = soup.get_text(separator=" ", strip=True)
-        links = [urljoin(url, a.get("href")) for a in soup.find_all("a", href=True)]
+        title = ""
+        if soup.title and soup.title.string:
+            title = soup.title.string.strip()
 
-        return {"url": url, "text": text, "links": links}
+        text = soup.get_text(separator=" ", strip=True)
+
+        # Remove excessive whitespace
+        text = " ".join(text.split())
+
+        # Limit content size
+        text = text[:8000]
+
+        final_url = str(response.url)
+
+        links = [
+            urljoin(final_url, a.get("href"))
+            for a in soup.find_all("a", href=True)
+        ]
+
+        return {
+            "url": final_url,
+            "title": title,
+            "text": text,
+            "links": links,
+        }
+
     except Exception:
         return None
 
 
-async def crawl_website(start_url: str, max_pages: int = MAX_PAGES_TO_CRAWL) -> list[dict]:
+async def crawl_website(
+    start_url: str,
+    max_pages: int = MAX_PAGES_TO_CRAWL,
+) -> list[dict]:
     """
-    Discovers and crawls up to `max_pages` relevant pages on the same domain.
-    Uses asyncio.gather with return_exceptions so one bad page never kills the crawl.
+    Crawl homepage + important internal pages.
+
+    Returns:
+    [
+        {
+            "url": "...",
+            "title": "...",
+            "text": "...",
+            "links": [...]
+        }
+    ]
     """
-    domain = urlparse(start_url).netloc
+
     visited: set[str] = set()
     results: list[dict] = []
 
-    async with httpx.AsyncClient(headers={"User-Agent": "Mozilla/5.0 (compatible; ResearchBot/1.0)"}) as client:
-        # First fetch the homepage to discover internal links
-        home = await _fetch_page(client, start_url)
-        if not home:
+    async with httpx.AsyncClient(
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 "
+                "(compatible; CompanyResearchBot/1.0)"
+            )
+        }
+    ) as client:
+
+        homepage = await _fetch_page(client, start_url)
+
+        if not homepage:
             return results
 
-        visited.add(_normalize_url(start_url))
-        results.append(home)
+        domain = _normalize_domain(
+            urlparse(homepage["url"]).netloc
+        )
 
-        # Rank discovered links: priority pages first, then everything else, skip ignored
+        visited.add(_normalize_url(homepage["url"]))
+        results.append(homepage)
+
         candidate_links = []
-        for link in home["links"]:
+
+        for link in homepage["links"]:
+
+            if _is_ignored(link):
+                continue
+
             parsed = urlparse(link)
-            if parsed.netloc != domain:
+
+            if _normalize_domain(parsed.netloc) != domain:
                 continue
-            norm = _normalize_url(link)
-            if norm in visited or _is_ignored(link):
+
+            normalized = _normalize_url(link)
+
+            if normalized in visited:
                 continue
+
             candidate_links.append(link)
 
-        candidate_links.sort(key=lambda l: (not _is_priority(l), l))
+        # Priority pages first
+        candidate_links.sort(
+            key=lambda url: (
+                not _is_priority(url),
+                url,
+            )
+        )
+
         remaining_slots = max_pages - 1
+
         to_fetch = []
-        seen_norm = set(visited)
+        seen_urls = set(visited)
+
         for link in candidate_links:
-            norm = _normalize_url(link)
-            if norm in seen_norm:
+
+            normalized = _normalize_url(link)
+
+            if normalized in seen_urls:
                 continue
-            seen_norm.add(norm)
+
+            seen_urls.add(normalized)
+
             to_fetch.append(link)
+
             if len(to_fetch) >= remaining_slots:
                 break
 
-        # Fetch remaining pages concurrently; failures return None and are filtered out
-        fetched = await asyncio.gather(*[_fetch_page(client, link) for link in to_fetch])
-        for page in fetched:
+        fetched_pages = await asyncio.gather(
+            *[_fetch_page(client, url) for url in to_fetch],
+            return_exceptions=True,
+        )
+
+        for page in fetched_pages:
+
+            if isinstance(page, Exception):
+                continue
+
             if page:
                 results.append(page)
 

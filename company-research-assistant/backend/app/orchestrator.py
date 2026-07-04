@@ -9,6 +9,7 @@ successfully gathered.
 """
 
 from typing import List
+from urllib.parse import urlparse
 
 from app.models.schemas import CompanyData, Competitor, ResearchResponse
 from app.services import (
@@ -21,6 +22,22 @@ from app.services import (
     competitor_validator,
     pdf_generator,
 )
+
+
+def _clean_search_term(resolved: dict, website_url: str | None, fallback: str) -> str:
+    """
+    BUG FIX: previously gather_public_info() was called with
+    resolved.get("value", query), which for URL-type input is the raw URL
+    (e.g. "https://stripe.com"). Feeding a full URL into a text search
+    query works worse than a clean term, and duplicates the scheme/path
+    noise across every search. This derives a clean, search-friendly term:
+    the company name if we have one, otherwise the bare domain.
+    """
+    if resolved["type"] == "name":
+        return resolved["value"]
+    target = website_url or resolved["value"]
+    netloc = urlparse(target).netloc or target
+    return netloc.removeprefix("www.") or fallback
 
 
 async def run_research(query: str, model: str) -> ResearchResponse:
@@ -62,19 +79,24 @@ async def run_research(query: str, model: str) -> ResearchResponse:
         warnings.append(f"Content cleaning failed, using raw crawl text: {e}")
         cleaned_content = "\n\n".join(p.get("text", "") for p in crawled_pages)[:8000]
 
+    # Fallback display name used until/unless the AI gives us a real one
+    # (BUG FIX: this used to be assigned straight into CompanyData.company_name,
+    # which meant URL input always displayed as a raw URL instead of a name)
+    fallback_company_name = resolved["value"] if resolved["type"] == "name" else (website_url or query)
+
     # ---------- Stage 5: extra public info via search (best-effort) ----------
     extra_info = ""
     try:
-        extra_info = await serper.gather_public_info(resolved.get("value", query))
+        search_term = _clean_search_term(resolved, website_url, fallback_company_name)
+        extra_info = await serper.gather_public_info(search_term)
     except Exception as e:
         warnings.append(f"Additional public search failed: {e}")
 
     # ---------- Stage 6: AI analysis (OpenRouter) ----------
-    company_name = resolved["value"] if resolved["type"] == "name" else (website_url or query)
     ai_result = None
     try:
         prompt = prompt_builder.build(
-            company_name=company_name,
+            company_name=fallback_company_name,
             website=website_url,
             crawled_content=cleaned_content,
             extra_info=extra_info,
@@ -86,11 +108,26 @@ async def run_research(query: str, model: str) -> ResearchResponse:
     if not ai_result:
         # Fallback: return whatever raw data we have, no AI-derived fields
         ai_result = {
-            "summary": None,
-            "products_services": [],
-            "pain_points": [],
-            "competitors": [],
-        }
+        "company_name": None,
+        "industry": None,
+        "summary": None,
+        "business_model": None,
+
+        "target_customers": [],
+
+        "products_services": [],
+
+        "strengths": [],
+        "weaknesses": [],
+        "opportunities": [],
+        "threats": [],
+
+        "pain_points": [],
+
+        "competitors": [],
+    }
+
+    company_name = ai_result.get("company_name") or fallback_company_name
 
     # ---------- Stage 7: validate competitors ----------
     validated_competitors: List[Competitor] = []
@@ -107,10 +144,30 @@ async def run_research(query: str, model: str) -> ResearchResponse:
     data = CompanyData(
         company_name=company_name,
         website=website_url,
+
         phone="Not publicly listed",
         address="Not publicly listed",
+
+        industry=ai_result.get("industry"),
+
+        summary=ai_result.get("summary"),
+
+        business_model=ai_result.get("business_model"),
+
+        target_customers=ai_result.get("target_customers", []),
+
         products_services=ai_result.get("products_services", []),
+
+        strengths=ai_result.get("strengths", []),
+
+        weaknesses=ai_result.get("weaknesses", []),
+
+        opportunities=ai_result.get("opportunities", []),
+
+        threats=ai_result.get("threats", []),
+
         pain_points=ai_result.get("pain_points", []),
+
         competitors=validated_competitors,
     )
 
